@@ -1,0 +1,7 @@
+numpy
+pandas
+pillow
+opencv-python-headless
+httpx
+scipy
+projectaria_tools
