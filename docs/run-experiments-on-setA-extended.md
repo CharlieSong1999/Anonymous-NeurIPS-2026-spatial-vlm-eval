@@ -2,7 +2,7 @@
 
 **Date**: 2026-04-27
 **Status**: living document
-**Audience**: anyone who wants to run a new VLM evaluation (Q1 or Q2),
+**Audience**: anyone who wants to run a new VLM evaluation,
 add a model, build a new metric, or extend the test set.
 
 ---
@@ -11,21 +11,16 @@ add a model, build a new metric, or extend the test set.
 
 Everything in this project's "v2" evaluation pipeline lives under
 `meta/testset/`. The canonical test set is **`setA_extended`** — 2000
-queries (1455 HD-Epic + 545 Epic-Kitchens). Two question formats are
-supported on the same frames:
+queries (1455 HD-Epic + 545 Epic-Kitchens).
 
-- **Q1**: open-ended bin distribution (4 yaw × 3 height = 12 joint
-  bins). Models output JSON with `yaw_bin_id` and `pitch`. Used with
-  M=20 samples per query.
-- **Q2**: 4-way multiple-choice on a 2x3 cubemap with markers in the
-  unseen region. Models output JSON with `answer ∈ {A,B,C,D}`. Used
-  with M=1.
+The task is **open-ended bin distribution**: a 4-bin yaw × 3-bin
+height = 12-bin joint label. Models output JSON with `yaw_bin_id` and
+`pitch`; we report metrics over M=20 samples per query.
 
-To add a new evaluation: copy `src/eval_v2.py` (Q1) or `src/q2_eval.py`
-(Q2), change the prompt builder / model list / condition logic, run
-against the local vLLM servers or API endpoints. To compute new
-metrics: read JSONL output, group by (sample_id, condition, model),
-aggregate.
+To add a new evaluation: copy `src/eval_v2.py`, change the prompt
+builder / model list / condition logic, run against the local vLLM
+servers or API endpoints. To compute new metrics: read JSONL output,
+group by (sample_id, condition, model), aggregate.
 
 **Mandatory pre-read**: [`cautious-on-hd-epic.md`](./cautious-on-hd-epic.md)
 covers two non-obvious data quirks (Aria pose convention, fisheye
@@ -47,24 +42,12 @@ meta/testset/
 │   ├── human_eval/pool_state.json              # 100 sample_ids in the human-eval active pool
 │   ├── captions_v2.jsonl                       # Gemini-3-flash captions for setA (300-version)
 │   ├── captions_v2_extended.jsonl              # captions for setA_extended frames
-│   ├── setA_extended_q2/                       # Q2 cubemap assets per strategy
-│   │   ├── A_random_diff_face/
-│   │   │   ├── images/<sample_id>.jpg          # 2x3 cubemap PNG-as-JPEG with markers
-│   │   │   └── queries.parquet                 # one row per cubemap (1975 rows total)
-│   │   └── C_no_target_cluster/
-│   │       └── …same layout…
 │   └── (legacy 300-query sets, build artifacts, candidate pools)
 ├── src/                                        # all production scripts
 │   ├── build_extended_testset.py               # builds setA_extended from candidate pool
 │   ├── caption_and_filter_extended.py          # captions + drops queries where target visible
 │   ├── eval_v2.py                              # ★ Q1 eval pipeline
 │   ├── metrics_v2.py                           # ★ Q1 metrics
-│   ├── q2_pilot.py                             # ★ single-frame Q2 cubemap renderer
-│   ├── q2_generate_full.py                     # batch Q2 cubemap renderer
-│   ├── q2_eval.py                              # ★ Q2 eval pipeline
-│   ├── q2_metrics.py                           # ★ Q2 metrics + Q1↔Q2 cross-format
-│   ├── q2_human_gradio.py                      # 100-query Q2 trial Gradio app
-│   ├── q2_rotation_visualize.py                # before/after fix comparisons
 │   ├── purge_hd_jsonl.py                       # remove HD records from eval JSONLs
 │   ├── m_ablation*.py                          # M (samples-per-query) ablations
 │   ├── build_tiny_subset.py                    # builds setA_tiny_300.parquet + subset_membership.json
@@ -473,117 +456,13 @@ and re-aggregate any metric script with `--eval-set 100` or
 `--eval-set 300` against the same JSONL outputs to see the metric
 restricted to that sub-pool — no re-querying needed.
 
----
-
-## §5 Running a Q2 evaluation (multiple-choice cubemap)
-
-### 5.1 The Q2 task
-
-Cubemap projection of the input frame into 6 faces (laid out 2×3:
-top row UP/FRONT/DOWN, bottom row LEFT/BEHIND/RIGHT). Visible RGB
-content fills only the camera's FOV cone; rest is dark grey. Four
-markers (A/B/C/D) are placed in the dark/unseen region of the
-cubemap; one marks the GT 3D location of the target object, the
-other three are distractors. Model picks one letter.
-
-### 5.2 Asset generation (one-time, ~5 min)
-
-```bash
-conda run -n slam python3 -m src.q2_generate_full \
-    --strategies A_random_diff_face C_no_target_cluster
-```
-
-This reads `data/setA_extended.parquet` and writes:
-- `data/setA_extended_q2/<strategy>/images/<sample_id>.jpg`
-- `data/setA_extended_q2/<strategy>/queries.parquet`
-
-Two distractor strategies are supported:
-- `A_random_diff_face`: distractors uniformly placed in faces ≠ GT face.
-- `C_no_target_cluster`: like A but rejects directions within 30° of
-  any other instance of the same target class in the scene (uses
-  `step7_results.json`). Falls back to A when target is single-instance
-  in scene.
-
-To regenerate only HD frames (e.g. after fixing an HD-only bug):
-
-```bash
-conda run -n slam python3 -m src.q2_generate_full \
-    --datasets hd_epic hd_extended
-```
-
-This re-renders only HD cubemaps, merges new HD rows with preserved
-EK rows in `queries.parquet`. Uses `hashlib.md5` for deterministic
-RNG seeding (so the per-query cubemap is reproducible across runs).
-
-### 5.3 The Q2 prompt
-
-Mirrors the Q1 sighted prompt structure (same opening, same
-"OUT OF VIEW" framing, same JSON output with `justification`). Two
-input variants are supported:
-
-| Variant | Sends |
-|---|---|
-| `cubemap_only` | 1 image: 2×3 cubemap with markers |
-| `frame_plus_cubemap` | 2 images: original frame + 2×3 cubemap |
-
-Prompt builders in `src/q2_eval.py`: `build_prompt_cubemap_only()` and
-`build_prompt_frame_plus_cubemap()`. Output schema:
-```json
-{"justification": "...", "answer": "<A|B|C|D>"}
-```
-
-### 5.4 Running the eval
-
-```bash
-# Local models, all 4 conditions
-conda run -n slam python3 -m src.q2_eval \
-    --models qwen3.5-9b gemma-4-31b qwen3-vl-30b \
-    --conditions A_cubemap_only A_frame_plus_cubemap \
-                 C_cubemap_only C_frame_plus_cubemap
-
-# API models (gemini, gpt) — only frame_plus_cubemap by user policy
-conda run -n slam python3 -m src.q2_eval \
-    --models gemini-3-flash gpt-5.4 \
-    --conditions A_frame_plus_cubemap
-
-# Tiny / human-pool subsets (filters by q1_sample_id linkage)
-conda run -n slam python3 -m src.q2_eval --eval-set 300 --models qwen3.5-9b
-conda run -n slam python3 -m src.q2_eval --eval-set 100 --models qwen3.5-9b
-
-# Smoke test (caps to first N rows regardless of subset)
-conda run -n slam python3 -m src.q2_eval --max 5 --models qwen3.5-9b
-```
-
-**Q2 uses M=1** (single sample per query — the answer is sharp;
-no need for distribution estimation like Q1). Resume-from-existing
-JSONL is automatic.
-
-`--eval-set 300` and `--eval-set 100` filter the Q2 strategy parquet
-by the `q1_sample_id` foreign key, so a Q2 ablation on the 300 subset
-covers exactly the Q1 queries in the 300 subset (and similarly for
-100). Combine with the same flag on `q2_cot_eval.py` for CoT ablations.
-
-### 5.5 Q2 metrics
-
-```bash
-conda run -n slam python3 -m src.q2_metrics
-```
-
-Outputs to `exp/q2_eval_001/results/`:
-- `aggregate.csv` — per (condition, model): mode_acc, parse_rate,
-  per-letter distribution, per-letter precision/recall.
-- `per_face.csv` — accuracy bucketed by GT face (face-position bias check).
-- `q1_q2_joint.csv` — per-query Q1↔Q2 contingency on shared sample_ids.
-- `results.md` — human-readable rollup.
-
----
 
 ## §6 Adding a new model
 
 Local model (vLLM-served, OpenAI-compatible):
 
 ```python
-# In src/eval_v2.py and/or src/q2_eval.py, add to MODELS dict:
+# In src/eval_v2.py, add to MODELS dict:
 'newmodel-name': {
     'api': 'openai_compat',
     'base_url': 'http://127.0.0.1:PORT/v1/chat/completions',
