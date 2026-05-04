@@ -283,12 +283,15 @@ async def call_gemini(prompt, image_bytes_list, model_cfg,
             'maxOutputTokens': max_tokens,
         },
     }
+    # Auth via header (NOT URL param) so the key never lands in HTTP
+    # request logs / proxies / process listings.
     url = (f'https://generativelanguage.googleapis.com/v1beta/models/'
-           f'{model_cfg["model_id"]}:generateContent?key={api_key}')
+           f'{model_cfg["model_id"]}:generateContent')
+    headers = {'x-goog-api-key': api_key}
     async with httpx.AsyncClient(timeout=120) as client:
         for attempt in range(5):
             try:
-                resp = await client.post(url, json=payload)
+                resp = await client.post(url, headers=headers, json=payload)
                 if resp.status_code == 200:
                     data = resp.json()
                     cand = data.get('candidates', [{}])[0]
