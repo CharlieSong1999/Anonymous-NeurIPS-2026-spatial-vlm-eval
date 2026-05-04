@@ -211,12 +211,21 @@ PROMPT_BUILDERS = {
 # ── Frame I/O ────────────────────────────────────────────────────────
 def resolve_frame_path(dataset: str, video_id: str, frame_index: int,
                        participant_id: str,
-                       bundled_frame_path: str | None = None) -> str:
+                       bundled_frame_path: str | None = None,
+                       q2_strategy: str | None = None) -> str:
     """Resolve a source-frame path. Prefers `bundled_frame_path` (the
     relative path shipped by the HF q2-cubemap-mcq dataset under each
-    strategy's `frames/` tree). Falls back to the legacy upstream layout."""
+    strategy's `frames/` tree). Falls back to the legacy upstream layout.
+
+    `q2_strategy` is required when using `bundled_frame_path` because
+    each strategy ships its own `frames/` subtree under
+    `Q2_DATASET_ROOT/<strategy>/`.
+    """
     if bundled_frame_path:
-        return str(Q2_DATASET_ROOT / bundled_frame_path)
+        if q2_strategy:
+            return str(Q2_DATASET_ROOT / q2_strategy / bundled_frame_path)
+        # backward-compat: also try Q1's bundled location
+        return str(Q1_DATASET_ROOT / bundled_frame_path)
     if dataset == 'epic_kitchens':
         return str(EK_ROOT / participant_id / video_id / 'frames'
                    / f'frame_{frame_index:010d}.jpg')
@@ -469,7 +478,8 @@ async def eval_condition_model(cond_name, queries_df, cubemap_dir,
             fp = resolve_frame_path(
                 row['dataset'], row['video_id'], int(row['frame_index']),
                 row['participant_id'],
-                bundled_frame_path=row.get('bundled_frame_path'))
+                bundled_frame_path=row.get('bundled_frame_path'),
+                q2_strategy=row.get('q2_strategy'))
             if fp in frame_cache:
                 fr_bytes = frame_cache[fp]
             else:
