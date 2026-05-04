@@ -484,7 +484,8 @@ FILTERS = {
 
 def evaluate_subset(name: str, set_df: pd.DataFrame, captions: dict,
                        min_n: int = 5, include_humans: bool = False,
-                       include_old_models: bool = False):
+                       include_old_models: bool = False,
+                       api_M_target: int = 20):
     """Evaluate all rows on the given subset under all three filters.
     Returns a dict with per-filter pair data and per-(filter, task)
     aggregated rows."""
@@ -506,7 +507,7 @@ def evaluate_subset(name: str, set_df: pd.DataFrame, captions: dict,
         if not mpath.exists():
             continue
         preds = load_api_predictions(mpath, sids_filter=eval_sids,
-                                          M_target=20)
+                                          M_target=api_M_target)
         if preds:
             predictions[mname] = preds
     if include_humans:
@@ -534,6 +535,14 @@ def evaluate_subset(name: str, set_df: pd.DataFrame, captions: dict,
             for p, info in union_pairs.items()],
         key=lambda r: -r[1])
 
+    # Per-filter pair lists, sorted by n_frames descending.
+    pair_lists_by_filter = {}
+    for fname, groups in pairs_per_filter.items():
+        sorted_pairs = sorted(groups.items(), key=lambda kv: -len(kv[1]))
+        pair_lists_by_filter[fname] = [
+            {"target": p[0], "anchor": p[1], "n": len(sids)}
+            for p, sids in sorted_pairs]
+
     results = {"subset": name, "n_sids": len(eval_sids),
                   "min_n": min_n,
                   "n_pairs_per_filter": {f: len(g)
@@ -542,6 +551,7 @@ def evaluate_subset(name: str, set_df: pd.DataFrame, captions: dict,
                       {"pair": f"{p[0]} \\| {p[1]}", "n": n,
                         "filters": fs}
                       for p, n, fs in union_pair_list],
+                  "pair_lists_by_filter": pair_lists_by_filter,
                   "filters": {}}
 
     for fname, pair_to_sids in pairs_per_filter.items():
@@ -686,47 +696,173 @@ def render_md(all_results: list, out_path: Path):
             "scaling is applied.\n\n")
         f.write("### Filter levels (matching `pairwise-metric.md`)\n\n")
         f.write(
-            "Three filter levels for the `(target, anchor)` pair set, "
-            "applied independently to the same caption→anchor "
-            "extraction pipeline:\n\n"
-            "**Filter A — strict same-zone.** Only pairs where target "
-            "and anchor are both in the **same primary kitchen work "
-            "zone** (sink-zone or stove-zone). Most restrictive; "
-            "highest expected `P_pairwise` non-uniformity. Per "
-            "`pairwise-metric.md` line 984: \"Sink-zone and stove-zone "
-            "pairs only.\"\n\n")
+            "Three filter levels for the `(target, anchor)` pair set "
+            "are evaluated. They share the same upstream pipeline:\n\n"
+            "1. **Caption parsing** — for every frame in the eval "
+            "subset we read its caption from "
+            "`meta/testset/data/captions_v2_extended.jsonl` and run "
+            "the regex anchor detector "
+            "`detect_anchors(caption)`. The detector recognises "
+            f"**{len(ANCHOR_PATTERNS)} kitchen anchor types** "
+            "(sink, stove, oven, fridge, microwave, hood, counter, "
+            "cabinet, window, door, shelf, drawer, draining_rack, "
+            "faucet, backsplash, washing_machine, radiator) via "
+            "case-insensitive `\\b…\\b` patterns. The output is "
+            "a `set` of anchor names per frame.\n"
+            "2. **Candidate pair enumeration** — for each frame "
+            "with target = `c`, we form candidate pairs `(c, vo)` "
+            "where `vo` ranges over the frame's detected anchors.\n"
+            "3. **Filter membership test** — each candidate is "
+            "tested under each of `is_filter_a`, `is_filter_b`, and "
+            "`is_filter_c` (defined below). A pair can be admitted "
+            "by zero, one, two, or all three filters; by "
+            "construction `Filter A ⊂ Filter B ⊂ Filter C`.\n"
+            "4. **Counting & frame-count threshold** — for each "
+            "admitted pair we collect the set of frames whose "
+            "(target, caption) supports it. Any pair with fewer "
+            "than `min_n` qualifying frames is dropped (the "
+            "`min_n` value depends on the eval subset; see the "
+            "subset section below).\n\n"
+            "All three filters use the same caption-derived anchor "
+            "set; the only thing that differs is the "
+            "(target, anchor)-acceptance rule.\n\n")
         f.write(
-            f"  - sink-zone targets = `{sorted(SINK_ZONE_TARGETS)}`\n"
-            f"  - sink-zone anchors = `{sorted(SINK_ZONE_ANCHORS)}`\n"
-            f"  - stove-zone targets = `{sorted(STOVE_ZONE_TARGETS)}`\n"
-            f"  - stove-zone anchors = `{sorted(STOVE_ZONE_ANCHORS)}`\n"
-            "  - A pair `(c, vo)` is in Filter A iff `c` is in one "
-            "zone's target list AND `vo` is in the **same zone**'s "
-            "anchor list (and `vo ≠ c`).\n\n")
+            "**Filter A — semantically strong co-location "
+            "(same-workstation pairs).**\n\n"
+            "**Intent.** Capture only pairs where the (target, "
+            "anchor) relationship is the strongest — both objects "
+            "live on or around the same kitchen *workstation*, so "
+            "their relative direction is dictated by the station's "
+            "physical layout. Examples: faucet ↔ sink (faucet is "
+            "*part of* the sink), pot ↔ stove (pot sits *on* the "
+            "stove), strainer ↔ draining-rack (used together at "
+            "the sink). For these pairs the GT pairwise prior "
+            "`P_pairwise(y | c, vo)` is the most non-uniform and "
+            "the metric is the most discriminative — but coverage "
+            "is the smallest because we admit only two work zones.\n\n"
+            "**Construction.** A pair `(c, vo)` is admitted iff "
+            "the target and the anchor are both members of the "
+            "*same primary kitchen work zone*. Two zones are "
+            "supported (mirroring `pairwise-metric.md` line 984: "
+            "\"Sink-zone and stove-zone pairs only.\"):\n\n"
+            f"- sink-zone targets = `{sorted(SINK_ZONE_TARGETS)}`\n"
+            f"- sink-zone anchors = `{sorted(SINK_ZONE_ANCHORS)}`\n"
+            f"- stove-zone targets = `{sorted(STOVE_ZONE_TARGETS)}`\n"
+            f"- stove-zone anchors = `{sorted(STOVE_ZONE_ANCHORS)}`\n\n"
+            "Acceptance rule: ` (c ∈ sink_targets ∧ vo ∈ "
+            "sink_anchors) ∨ (c ∈ stove_targets ∧ vo ∈ "
+            "stove_anchors)`, plus the always-applied `vo ≠ c` "
+            "guard. Targets in the broader `TARGET_RELATED` map "
+            "(below) that do not belong to either of these two "
+            "zones are excluded entirely from Filter A — even if "
+            "the anchor is in their per-target related list. "
+            "**Why two zones only?** Other zones (periphery, "
+            "storage, food/produce) don't cluster as tightly: a "
+            "fridge-trash-bin or a banana-draining-rack pair has "
+            "weaker geometric coupling than faucet-sink. Filter A "
+            "isolates the cleanest, most layout-determined "
+            "relationships.\n\n")
         f.write(
-            "**Filter B — per-target allowlist, generic anchors "
-            "excluded.** The recommended primary filter. Each target "
-            "has a hand-curated list of related anchors that may be "
-            "**cross-zone** (e.g. `cutting board ← sink`, "
-            "`plant ← window`, `banana ← draining_rack`). The "
-            "generic anchor set "
-            f"`{sorted(GENERIC_ANCHORS)}` is excluded — these "
-            "appear in 47–88 % of captions and produce near-uniform "
-            "`P_pairwise`. Filter A ⊂ Filter B.\n\n")
+            "**Filter B — semantically meaningful, broader "
+            "co-location (cross-zone allowed).**\n\n"
+            "**Intent.** Expand Filter A to include pairs that are "
+            "**functionally related but not necessarily on the "
+            "same workstation**. A cutting board lives near the "
+            "sink (you rinse veg before cutting); coffee pots sit "
+            "near the stove or on the counter; plants belong by "
+            "the window. These cross-zone relationships still "
+            "carry directional information — the GT pairwise prior "
+            "is still meaningfully non-uniform — but the relationship "
+            "is one step weaker than Filter A's "
+            "same-workstation-only definition. Filter B is the "
+            "**recommended primary filter**: enough coverage to "
+            "see meaningful trends, low enough noise to "
+            "discriminate between models.\n\n"
+            "**Construction.** Each target carries a hand-curated "
+            "**related-anchor allowlist** in `TARGET_RELATED` "
+            "(rendered in full at the bottom of this section). "
+            "Examples of cross-zone entries:\n\n"
+            "- `cutting board → {sink, faucet, stove, drawer}` — "
+            "prep area near the sink, possibly also near the stove.\n"
+            "- `plant → {window, shelf}` — plants live by light "
+            "sources, not by water/heat.\n"
+            "- `banana → {fridge, draining_rack, window}` — fruit "
+            "on counter near the sink/window or in the fridge.\n"
+            "- `wall socket → {door, window}` — outlets cluster on "
+            "structural walls.\n\n"
+            "**Generic anchors are excluded** at this level. "
+            f"`GENERIC_ANCHORS = {sorted(GENERIC_ANCHORS)}` are "
+            "the three anchors that appear in 47–88 % of all "
+            "captions — every kitchen has a counter, a cabinet, "
+            "and a backsplash — so conditioning on them yields "
+            "near-uniform `P_pairwise(y | c, vo)` for almost every "
+            "target. Including them in Filter B would dilute the "
+            "signal that informative anchors carry.\n\n"
+            "Acceptance rule: `(vo ∈ TARGET_RELATED[c]) ∧ (vo ∉ "
+            "GENERIC_ANCHORS) ∧ (vo ≠ c)`. By construction "
+            "`Filter A ⊂ Filter B`: every Filter-A pair has its "
+            "anchor in the target's TARGET_RELATED list (the lists "
+            "were drawn to satisfy this) and the anchor is "
+            "non-generic by Filter A's definition.\n\n")
         f.write(
-            "**Filter C — Filter B + generic anchors.** The same per-"
-            "target allowlists as B, but with "
-            f"`{sorted(GENERIC_ANCHORS)}` re-added for every target. "
-            "Most permissive; covers near-uniform pairs that dilute "
-            "the discriminative signal. Filter A ⊂ Filter B ⊂ "
-            "Filter C.\n\n")
+            "**Filter C — all semantically related (generic "
+            "anchors re-included).**\n\n"
+            "**Intent.** A robustness / stress-test filter that "
+            "**adds back the universally-present anchors** "
+            "(counter, cabinet, backsplash) on top of Filter B's "
+            "allowlist. These anchors don't carry directional "
+            "information — a counter is everywhere — so pairs "
+            "involving them push `P_pairwise` toward uniform. "
+            "Filter C is therefore the **most permissive but the "
+            "least discriminative**: it expands coverage enormously "
+            "(e.g. 33 → 134 pairs on full setA) but the gap "
+            "between best model and Uniform shrinks. Useful for: "
+            "(a) confirming the metric ranking is stable when "
+            "generic-anchor pairs are mixed in, (b) sanity-checking "
+            "that the discriminative power of Filter B comes from "
+            "the informative anchors and not from spurious "
+            "filtering, (c) seeing what coverage looks like before "
+            "any anchor pruning.\n\n"
+            "**Construction.** Same per-target allowlist as "
+            "Filter B, but the generic-anchor exclusion is "
+            "dropped — every target with a `TARGET_RELATED` entry "
+            "is allowed to pair with each of "
+            f"`{sorted(GENERIC_ANCHORS)}` in addition to its "
+            "specific allowlist.\n\n"
+            "Acceptance rule: `(vo ∈ TARGET_RELATED[c] ∪ "
+            "GENERIC_ANCHORS) ∧ (vo ≠ c)`. By construction "
+            "`Filter B ⊂ Filter C`. The new pairs added by C are "
+            "exactly the (target, generic-anchor) pairs for "
+            "targets that have a `TARGET_RELATED` entry — "
+            "everything else is the same as Filter B.\n\n")
+        f.write(
+            "**Summary of filter intent.** Filter A asks: \"how do "
+            "models do on the strongest spatial-prior pairs we can "
+            "name?\" Filter B asks: \"how do models do on the full "
+            "set of *informative* spatial-prior pairs?\" Filter C "
+            "asks: \"does the picture change when we include "
+            "anchors that are everywhere?\" The recommended "
+            "headline metric is Filter B; A and C bracket it as "
+            "robustness checks.\n\n")
         # Inline TARGET_RELATED for transparency
-        f.write("**Per-target related anchors (used by Filters B and C):**\n\n")
+        f.write("**Per-target related-anchor allowlist `TARGET_RELATED` "
+                  "(used by Filters B and C):**\n\n")
+        f.write(
+            "Each row lists the anchors a given target is allowed "
+            "to pair with. The list was hand-curated from kitchen "
+            "functional knowledge: anchors that are typically "
+            "co-located with the target in real kitchens (e.g. "
+            "`faucet → sink`, `cutting board → drawer`, "
+            "`bread → oven`).\n\n")
         f.write("| Target | Related anchors |\n|---|---|\n")
         for tgt in sorted(TARGET_RELATED.keys()):
             anchors = ", ".join(f"`{a}`" for a in sorted(TARGET_RELATED[tgt]))
             f.write(f"| {tgt} | {anchors} |\n")
-        f.write("\n")
+        f.write(
+            "\nTargets *not* listed in `TARGET_RELATED` are "
+            "excluded from all three filters — there is no "
+            "kitchen-functional reason to expect a non-uniform "
+            "spatial prior for them.\n\n")
         f.write("### Eval subsets\n\n")
         f.write(
             "- **full setA** = `setA_extended_filtered.parquet` (1951 "
@@ -752,21 +888,35 @@ def render_md(all_results: list, out_path: Path):
                     "is undefined here.\n\n")
                 continue
 
-            # Combined pair list with filter-membership column
-            if res["union_pair_list"]:
-                f.write("### (c, vo) pairs available "
-                          "(membership across filters)\n\n")
+            # Per-filter pair lists, in their own subsections so the
+            # reader can inspect membership for each filter
+            # independently (and verify the A ⊂ B ⊂ C nesting).
+            pair_lists = res.get("pair_lists_by_filter", {})
+            if pair_lists:
+                f.write("### (c, vo) pairs available, per filter\n\n")
                 f.write(
-                    "Each row shows where the pair first appears: "
-                    "`A` = strict same-zone (also in B and C), "
-                    "`AB`/`B` = added by B, `BC`/`C` = added by C. "
-                    "Pairs with `n_frames < min_n` are dropped.\n\n")
-                f.write("| Pair (target \\| anchor) | n_frames | Filters |\n")
-                f.write("|---|---:|---|\n")
-                for entry in res["union_pair_list"]:
-                    f.write(f"| {entry['pair']} | {entry['n']} | "
-                              f"{entry['filters']} |\n")
-                f.write("\n")
+                    "By construction `Filter A ⊂ Filter B ⊂ Filter C` "
+                    "for any given subset; the three lists below are "
+                    "the *qualifying* pairs after the `n_frames ≥ "
+                    f"{res['min_n']}` cut for this subset. The same "
+                    "frame can be assigned to multiple `(c, vo)` pairs "
+                    "if its caption mentions multiple anchors that "
+                    "qualify with the row's target.\n\n")
+                for fname in ("A", "B", "C"):
+                    pairs = pair_lists.get(fname, [])
+                    f.write(f"#### Filter {fname} "
+                              f"({len(pairs)} pair{'s' if len(pairs) != 1 else ''})\n\n")
+                    if not pairs:
+                        f.write(f"_No pairs satisfy `n_frames ≥ "
+                                  f"{res['min_n']}` for this filter._\n\n")
+                        continue
+                    f.write("| Target | Anchor | n_frames |\n")
+                    f.write("|---|---|---:|\n")
+                    for entry in pairs:
+                        f.write(f"| {entry['target']} | "
+                                  f"{entry['anchor']} | "
+                                  f"{entry['n']} |\n")
+                    f.write("\n")
 
             # Side-by-side JSD table per task
             for task in ("yaw", "pitch", "joint"):
@@ -937,9 +1087,10 @@ def main():
         all_results.append(evaluate_subset(
             "setA-300", set300_df, captions, min_n=5, include_humans=False))
     if args.eval_set in ("100", "all"):
+        # Match humans' M=10 ensemble — APIs use M=10 here for parity.
         all_results.append(evaluate_subset(
             "human pool (100)", pool_df, captions, min_n=2,
-            include_humans=True))
+            include_humans=True, api_M_target=10))
 
     suffix = "" if args.eval_set == "all" else f"_{args.eval_set}"
 

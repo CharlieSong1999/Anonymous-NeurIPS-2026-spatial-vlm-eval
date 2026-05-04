@@ -778,7 +778,7 @@ def main():
     pool_sids = set(pool_state["active"])
 
     print(f"\nAPI rows on the 100-sample human pool (eval=human's "
-          f"69-sample subset) at M=20 and M=6…")
+          f"69-sample subset) at M=20, M=10 (humans-budget match), and M=6…")
     api_split = {  # apply same scene-disjoint split to the pool
         "calibration_sample_ids": sorted(
             s for s in pool_sids
@@ -790,11 +790,15 @@ def main():
             and set_df.loc[s, "participant_id"] not in CAL_PIDS),
     }
     api_m20_rows = []
+    api_m10_rows = []
     api_m6_rows = []
     for aname, apath in API_MODELS.items():
         if not apath.exists():
             continue
-        for M_target, dst in ((20, api_m20_rows), (6, api_m6_rows)):
+        for M_target, dst in (
+                (20, api_m20_rows),
+                (10, api_m10_rows),
+                (6, api_m6_rows)):
             counts, M_per = load_api_counts_at_M(
                 apath, M_target, sids_filter=pool_sids)
             if not counts:
@@ -884,15 +888,17 @@ def main():
 
         # API model rows on the SAME 100-sample human pool — head-to-head
         # with humans (n_eval = same 69 sids).
-        if api_m20_rows or api_m6_rows:
+        if api_m20_rows or api_m10_rows or api_m6_rows:
             f.write("\n**API models on the human pool** "
                       "(SAME 69-sample eval subset as the humans above; "
-                      "first true head-to-head):\n\n")
+                      "first true head-to-head). M=10 is the budget-"
+                      "matched cut to humans (10 annotators); M=6 is "
+                      "tighter still; M=20 is the locked default.\n\n")
             f.write("| Model | n_eval | Acc | Floored NLL | Smooth NLL | "
                       "Calib NLL | T* | H_pre | H_post | Oracle T | "
                       "δ_oracle |\n")
             f.write("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
-            for r in api_m20_rows + api_m6_rows:
+            for r in api_m20_rows + api_m10_rows + api_m6_rows:
                 f.write(fmt_row(r) + "\n")
 
         # VLM rows at M=5 (apples-to-apples with the human ensembles)
@@ -928,7 +934,7 @@ def main():
         # Per-(model, category) intermediate breakdown (only meaningful
         # when averaging=category).
         if averaging == "category":
-            named_rows = [r for r in (ensemble_rows + api_m20_rows + api_m6_rows
+            named_rows = [r for r in (ensemble_rows + api_m20_rows + api_m10_rows + api_m6_rows
                                           + vlm_m5_rows + vlm_m20_rows)
                             if r.get("per_category")]
             if named_rows:
@@ -943,7 +949,7 @@ def main():
                 # Group rows by eval-subset signature so the breakdown
                 # tables are coherent.
                 sigs = {}
-                human_pool_rows = ensemble_rows + api_m20_rows + api_m6_rows
+                human_pool_rows = ensemble_rows + api_m20_rows + api_m10_rows + api_m6_rows
                 for r in named_rows:
                     sig = ("human-pool" if r in human_pool_rows
                               else "setA-203")

@@ -31,6 +31,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -45,33 +46,64 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
                     datefmt="%H:%M:%S")
 
 # ── Paths ─────────────────────────────────────────────────────────────
-TESTSET = Path("/path/to/this/repo")
+# All paths are env-driven so a fresh clone + `huggingface-cli download
+# nipsedtrack2026/q1-bin-prediction --local-dir data/q1` followed by
+# `python -m src.eval_v2` works out of the box from the eval-code root.
+TESTSET = Path(os.environ.get(
+    "TESTSET_ROOT",
+    str(Path(__file__).resolve().parents[1]),  # default: parent of src/
+))
+Q1_DATASET_ROOT = Path(os.environ.get(
+    "Q1_DATASET_ROOT",
+    str(TESTSET / "data" / "q1"),  # default: ./data/q1
+))
 DATA_DIR = TESTSET / "data"
-EXP_DIR = TESTSET / "exp" / "sampling_ablation_001"
-RUNS_DIR = EXP_DIR / "runs"
+RUNS_DIR = Path(os.environ.get(
+    "RUNS_DIR",
+    str(TESTSET / "runs"),  # default: ./runs
+))
 RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
-EK_ROOT = Path("/path/to/epic-kitchens")
-HD_ROOT = Path(
-    "/path/to/hd-epic/Participants"
-)
+# Legacy upstream-frame roots — only used when bundled_frame_path is
+# missing from the queries parquet (i.e. you're not using the HF dataset).
+EK_ROOT = Path(os.environ.get(
+    "EK_FRAMES_ROOT",
+    "/path/to/epic-kitchens",
+))
+HD_ROOT = Path(os.environ.get(
+    "HD_EPIC_FRAMES_ROOT",
+    "/path/to/hd-epic/Participants",
+))
 
 # ── Model endpoints ───────────────────────────────────────────────────
 MODELS = {
     'qwen3.5-9b': {
+        'api': 'openai_compat',
         'base_url': 'http://127.0.0.1:8001/v1/chat/completions',
         'model_id': 'Qwen/Qwen3.5-9B',
         'extra_body': {'chat_template_kwargs': {'enable_thinking': False}},
     },
     'gemma-4-31b': {
+        'api': 'openai_compat',
         'base_url': 'http://127.0.0.1:9002/v1/chat/completions',
         'model_id': 'google/gemma-4-31b-it',
         'extra_body': {},
     },
     'qwen3-vl-30b': {
+        'api': 'openai_compat',
         'base_url': 'http://127.0.0.1:18002/v1/chat/completions',
         'model_id': 'Qwen/Qwen3-VL-30B-A3B-Instruct',
         'extra_body': {},
+    },
+    'gemini-3-flash': {
+        'api': 'gemini',
+        'model_id': 'gemini-3-flash-preview',
+        'env_key': 'GEMINI_API_KEY',
+    },
+    'gpt-5.4': {
+        'api': 'openai',
+        'model_id': 'gpt-5.4',
+        'env_key': 'OPENAI_API_KEY',
     },
 }
 
@@ -163,7 +195,17 @@ CONDITIONS = {
 
 
 # ── Frame I/O ────────────────────────────────────────────────────────
-def resolve_frame_path(dataset: str, video_id: str, frame_index: int) -> str:
+def resolve_frame_path(dataset: str, video_id: str, frame_index: int,
+                       bundled_frame_path: str | None = None) -> str:
+    """Resolve a frame to an absolute path.
+
+    Preference: `bundled_frame_path` (relative path shipped by the HF
+    q1-bin-prediction dataset under `frames/`). Falls back to the legacy
+    upstream-style EK/HD layout when no bundled path is available (e.g.
+    when running against an out-of-tree custom queries parquet).
+    """
+    if bundled_frame_path:
+        return str(Q1_DATASET_ROOT / bundled_frame_path)
     if dataset == 'epic_kitchens':
         pid = video_id.split('_')[0]
         return str(EK_ROOT / pid / video_id / 'frames'
@@ -181,16 +223,15 @@ def img_to_jpeg_bytes(img_rgb, quality=90):
 
 
 # ── VLM call ─────────────────────────────────────────────────────────
-async def call_vlm(prompt, image_bytes_list, model_cfg, temperature, max_tokens):
+async def call_openai_compat(prompt, image_bytes_list, model_cfg,
+                              temperature, max_tokens):
     import httpx
-
     content = []
     for ib in image_bytes_list:
         b64 = base64.b64encode(ib).decode('ascii')
         content.append({'type': 'image_url',
                         'image_url': {'url': f'data:image/jpeg;base64,{b64}'}})
     content.append({'type': 'text', 'text': prompt})
-
     payload = {
         'model': model_cfg['model_id'],
         'messages': [
@@ -202,15 +243,13 @@ async def call_vlm(prompt, image_bytes_list, model_cfg, temperature, max_tokens)
     }
     if model_cfg.get('extra_body'):
         payload.update(model_cfg['extra_body'])
-
     async with httpx.AsyncClient(timeout=120) as client:
         for attempt in range(5):
             try:
                 resp = await client.post(
                     model_cfg['base_url'],
                     headers={'Authorization': 'Bearer placeholder'},
-                    json=payload,
-                )
+                    json=payload)
                 if resp.status_code == 200:
                     return resp.json()['choices'][0]['message']['content']
                 if resp.status_code in (429, 500, 502, 503):
@@ -223,6 +262,103 @@ async def call_vlm(prompt, image_bytes_list, model_cfg, temperature, max_tokens)
                     continue
                 return f'ERROR: {e}'
     return 'ERROR: max retries'
+
+
+async def call_gemini(prompt, image_bytes_list, model_cfg,
+                       temperature, max_tokens):
+    import httpx
+    api_key = os.environ.get(model_cfg['env_key'])
+    if not api_key:
+        return f'ERROR: {model_cfg["env_key"]} not set'
+    parts = []
+    for ib in image_bytes_list:
+        b64 = base64.b64encode(ib).decode('ascii')
+        parts.append({'inlineData': {'mimeType': 'image/jpeg', 'data': b64}})
+    parts.append({'text': prompt})
+    payload = {
+        'contents': [{'parts': parts}],
+        'systemInstruction': {'parts': [{'text': SYSTEM_PROMPT}]},
+        'generationConfig': {
+            'temperature': temperature,
+            'maxOutputTokens': max_tokens,
+        },
+    }
+    url = (f'https://generativelanguage.googleapis.com/v1beta/models/'
+           f'{model_cfg["model_id"]}:generateContent?key={api_key}')
+    async with httpx.AsyncClient(timeout=120) as client:
+        for attempt in range(5):
+            try:
+                resp = await client.post(url, json=payload)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    cand = data.get('candidates', [{}])[0]
+                    parts = cand.get('content', {}).get('parts', [])
+                    return ''.join(p.get('text', '') for p in parts)
+                if resp.status_code in (429, 500, 502, 503):
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                return f'ERROR: HTTP {resp.status_code}: {resp.text[:200]}'
+            except Exception as e:
+                if attempt < 4:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                return f'ERROR: {e}'
+    return 'ERROR: max retries'
+
+
+async def call_openai(prompt, image_bytes_list, model_cfg,
+                       temperature, max_tokens):
+    import httpx
+    api_key = os.environ.get(model_cfg['env_key'])
+    if not api_key:
+        return f'ERROR: {model_cfg["env_key"]} not set'
+    content = []
+    for ib in image_bytes_list:
+        b64 = base64.b64encode(ib).decode('ascii')
+        content.append({'type': 'image_url',
+                        'image_url': {'url': f'data:image/jpeg;base64,{b64}',
+                                       'detail': 'low'}})
+    content.append({'type': 'text', 'text': prompt})
+    payload = {
+        'model': model_cfg['model_id'],
+        'messages': [
+            {'role': 'system', 'content': SYSTEM_PROMPT},
+            {'role': 'user', 'content': content},
+        ],
+        'temperature': temperature,
+        'max_completion_tokens': max_tokens,
+    }
+    async with httpx.AsyncClient(timeout=120) as client:
+        for attempt in range(5):
+            try:
+                resp = await client.post(
+                    'https://api.openai.com/v1/chat/completions',
+                    headers={'Authorization': f'Bearer {api_key}'},
+                    json=payload)
+                if resp.status_code == 200:
+                    return resp.json()['choices'][0]['message']['content']
+                if resp.status_code in (429, 500, 502, 503):
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                return f'ERROR: HTTP {resp.status_code}: {resp.text[:200]}'
+            except Exception as e:
+                if attempt < 4:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                return f'ERROR: {e}'
+    return 'ERROR: max retries'
+
+
+async def call_vlm(prompt, image_bytes_list, model_cfg, temperature, max_tokens):
+    api = model_cfg.get('api', 'openai_compat')
+    if api == 'gemini':
+        return await call_gemini(prompt, image_bytes_list, model_cfg,
+                                  temperature, max_tokens)
+    if api == 'openai':
+        return await call_openai(prompt, image_bytes_list, model_cfg,
+                                  temperature, max_tokens)
+    return await call_openai_compat(prompt, image_bytes_list, model_cfg,
+                                     temperature, max_tokens)
 
 
 def parse_response(text):
@@ -287,8 +423,9 @@ async def eval_set_condition_model(set_name, set_df, condition_name,
         prompt = condition_cfg['prompt_fn'](label)
         # Image bytes
         if condition_cfg['send_image']:
-            fp = resolve_frame_path(row['dataset'], row['video_id'],
-                                    int(row['frame_index']))
+            fp = resolve_frame_path(
+                row['dataset'], row['video_id'], int(row['frame_index']),
+                bundled_frame_path=row.get('bundled_frame_path'))
             if fp in frame_cache:
                 img_list = [frame_cache[fp]]
             else:
@@ -333,20 +470,33 @@ async def eval_set_condition_model(set_name, set_df, condition_name,
 
 
 async def main_async(args):
-    logger.info('=== Eval v2 (sampling ablation) ===')
+    global M_REPEATS
+    if args.m_repeats is not None:
+        M_REPEATS = args.m_repeats
+    logger.info(f'=== Eval v2 (sampling ablation) — M={M_REPEATS} ===')
 
-    # Load sets
+    # Load sets. Resolution order for each `--sets` value:
+    #   - 'full' or 'q1' → Q1_DATASET_ROOT/queries.parquet (HF dataset)
+    #   - explicit path  → use as-is
+    #   - bare letter    → DATA_DIR/set{X}_300_filtered.parquet (legacy)
     sets = {}
     for s in args.sets:
-        path = DATA_DIR / f'set{s}_300_filtered.parquet'
+        if s in ('full', 'q1'):
+            path = Q1_DATASET_ROOT / 'queries.parquet'
+        elif Path(s).is_absolute() or '/' in s:
+            path = Path(s)
+        else:
+            path = DATA_DIR / f'set{s}_300_filtered.parquet'
         if not path.exists():
-            logger.error(f'Missing: {path}')
+            logger.error(f'Missing: {path}  '
+                         f'(set Q1_DATASET_ROOT or pass an explicit path)')
             sys.exit(1)
         sets[s] = pd.read_parquet(path)
         if args.eval_set != 'full':
             from src._eval_set import filter_by_eval_set
             sets[s] = filter_by_eval_set(sets[s], args.eval_set)
-        logger.info(f'  Set {s}: {len(sets[s])} queries (eval_set={args.eval_set})')
+        logger.info(f'  Set {s} ({path.name}): {len(sets[s])} queries '
+                    f'(eval_set={args.eval_set})')
 
     # Resolve conditions
     conditions = {c: CONDITIONS[c] for c in args.conditions if c in CONDITIONS}
@@ -375,10 +525,19 @@ async def main_async(args):
                     logger.info(f'    set{s} {c} {m}: {len(done)}/{expected}')
         return
 
-    # Server health checks
+    # Server health checks (vLLM-style endpoints only; APIs are checked
+    # at first request).
     import httpx
     async with httpx.AsyncClient(timeout=10) as client:
         for mname, mcfg in models.items():
+            if mcfg.get('api', 'openai_compat') != 'openai_compat':
+                # Gemini/OpenAI API: no /v1/models pre-check; warn if env key missing.
+                if mcfg.get('env_key') and not os.environ.get(mcfg['env_key']):
+                    logger.warning(f'  {mname}: env var {mcfg["env_key"]} '
+                                   f'not set — calls will fail')
+                else:
+                    logger.info(f'  {mname} (api={mcfg["api"]}): env OK')
+                continue
             url = mcfg['base_url'].rsplit('/v1/', 1)[0] + '/v1/models'
             try:
                 r = await client.get(url)
@@ -421,11 +580,20 @@ async def main_async(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--sets', nargs='+', default=['A', 'B'])
+    parser.add_argument('--sets', nargs='+', default=['full'],
+                        help="One or more set ids. 'full' / 'q1' load "
+                             "Q1_DATASET_ROOT/queries.parquet (HF dataset, "
+                             "default). 'A' / 'B' load the legacy "
+                             "set{X}_300_filtered.parquet. An explicit "
+                             "path is also accepted.")
     parser.add_argument('--conditions', nargs='+',
                         default=['sighted', 'blind', 'cot-e'])
     parser.add_argument('--models', nargs='+',
-                        default=['gemma-4-31b', 'qwen3-vl-30b'])
+                        default=['qwen3.5-9b'])
+    parser.add_argument('--m-repeats', '--m_repeats', dest='m_repeats',
+                        type=int, default=None,
+                        help='Override M (samples per query). '
+                             f'Default {25}.')
     parser.add_argument('--dry-run', action='store_true')
     from src._eval_set import add_eval_set_arg
     add_eval_set_arg(parser)

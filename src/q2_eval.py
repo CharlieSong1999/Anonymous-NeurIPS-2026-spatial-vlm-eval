@@ -28,6 +28,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -42,16 +43,36 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
                     datefmt="%H:%M:%S")
 
 # ── Paths ─────────────────────────────────────────────────────────────
-TESTSET = Path("/path/to/this/repo")
+# Env-driven so a fresh clone + `huggingface-cli download
+# nipsedtrack2026/q2-cubemap-mcq --local-dir data/q2` works out of the
+# box from the eval-code root.
+TESTSET = Path(os.environ.get(
+    "TESTSET_ROOT",
+    str(Path(__file__).resolve().parents[1]),
+))
+Q2_DATASET_ROOT = Path(os.environ.get(
+    "Q2_DATASET_ROOT",
+    str(TESTSET / "data" / "q2"),
+))
+Q1_DATASET_ROOT = Path(os.environ.get(
+    "Q1_DATASET_ROOT",
+    str(TESTSET / "data" / "q1"),
+))
 DATA_DIR = TESTSET / "data"
-EXP_DIR = TESTSET / "exp" / "q2_eval_001"
-RUNS_DIR = EXP_DIR / "runs"
+RUNS_DIR = Path(os.environ.get(
+    "Q2_RUNS_DIR",
+    str(TESTSET / "runs" / "q2"),
+))
 RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
-EK_ROOT = Path("/path/to/epic-kitchens")
-HD_ROOT = Path(
-    "/path/to/hd-epic/Participants"
-)
+EK_ROOT = Path(os.environ.get(
+    "EK_FRAMES_ROOT",
+    "/path/to/epic-kitchens",
+))
+HD_ROOT = Path(os.environ.get(
+    "HD_EPIC_FRAMES_ROOT",
+    "/path/to/hd-epic/Participants",
+))
 
 # ── Model endpoints (same as eval_v2.py) ─────────────────────────────
 MODELS = {
@@ -189,7 +210,13 @@ PROMPT_BUILDERS = {
 
 # ── Frame I/O ────────────────────────────────────────────────────────
 def resolve_frame_path(dataset: str, video_id: str, frame_index: int,
-                       participant_id: str) -> str:
+                       participant_id: str,
+                       bundled_frame_path: str | None = None) -> str:
+    """Resolve a source-frame path. Prefers `bundled_frame_path` (the
+    relative path shipped by the HF q2-cubemap-mcq dataset under each
+    strategy's `frames/` tree). Falls back to the legacy upstream layout."""
+    if bundled_frame_path:
+        return str(Q2_DATASET_ROOT / bundled_frame_path)
     if dataset == 'epic_kitchens':
         return str(EK_ROOT / participant_id / video_id / 'frames'
                    / f'frame_{frame_index:010d}.jpg')
@@ -439,9 +466,10 @@ async def eval_condition_model(cond_name, queries_df, cubemap_dir,
         if variant == 'cubemap_only':
             img_list = [cm_bytes]
         else:  # frame_plus_cubemap
-            fp = resolve_frame_path(row['dataset'], row['video_id'],
-                                    int(row['frame_index']),
-                                    row['participant_id'])
+            fp = resolve_frame_path(
+                row['dataset'], row['video_id'], int(row['frame_index']),
+                row['participant_id'],
+                bundled_frame_path=row.get('bundled_frame_path'))
             if fp in frame_cache:
                 fr_bytes = frame_cache[fp]
             else:
@@ -488,13 +516,19 @@ async def eval_condition_model(cond_name, queries_df, cubemap_dir,
 async def main_async(args):
     logger.info('=== Q2 Eval (4 conditions × M=%d) ===', M_REPEATS)
 
-    # Load queries per strategy
+    # Load queries per strategy. Resolution order:
+    #   - Q2_DATASET_ROOT/{strategy}/queries.parquet  (HF dataset, default)
+    #   - DATA_DIR/setA_extended_q2/{strategy}/queries.parquet  (legacy)
     strategy_queries = {}
     cubemap_dirs = {}
     for strat in STRATEGIES:
-        path = DATA_DIR / 'setA_extended_q2' / strat / 'queries.parquet'
+        path = Q2_DATASET_ROOT / strat / 'queries.parquet'
         if not path.exists():
-            logger.error(f'Missing: {path}')
+            path = DATA_DIR / 'setA_extended_q2' / strat / 'queries.parquet'
+        if not path.exists():
+            logger.error(f'Missing: {path}  '
+                         f'(set Q2_DATASET_ROOT or download '
+                         f'nipsedtrack2026/q2-cubemap-mcq)')
             sys.exit(1)
         df = pd.read_parquet(path)
         if args.eval_set != 'full':

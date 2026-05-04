@@ -15,13 +15,7 @@ results reported in the paper.
 # 1. Install deps (Python 3.11+ recommended)
 pip install -r requirements.txt
 
-# 2. Set environment variables for source-frame paths
-export EK_FRAMES_ROOT=/path/to/epic-kitchens
-export HD_EPIC_FRAMES_ROOT=/path/to/hd-epic/Participants
-export HD_EPIC_VRS_REFERENCE=/path/to/hd-epic/vrs/P01-20240202-110250_anonymized.vrs
-export PROJECT_ROOT=/path/to/this/repo  # optional; defaults to repo root
-
-# 3. Download datasets from Hugging Face
+# 2. Download datasets from Hugging Face
 huggingface-cli download nipsedtrack2026/q1-bin-prediction --repo-type=dataset --local-dir data/q1
 huggingface-cli download nipsedtrack2026/q2-cubemap-mcq    --repo-type=dataset --local-dir data/q2
 
@@ -29,9 +23,33 @@ huggingface-cli download nipsedtrack2026/q2-cubemap-mcq    --repo-type=dataset -
 #   https://huggingface.co/datasets/nipsedtrack2026/q1-bin-prediction
 #   https://huggingface.co/datasets/nipsedtrack2026/q2-cubemap-mcq
 
-# 4. Run a smoke test (3 queries, one local model)
-python -m src.q2_eval --max 3 --models qwen3.5-9b --conditions A_cubemap_only
+# 3. Run a smoke test (10 queries, one API model — needs GEMINI_API_KEY)
+export GEMINI_API_KEY=...        # for gemini-3-flash
+# export OPENAI_API_KEY=...      # for gpt-5.4
+
+# Q1 sighted, gemini-3-flash, M=1, 10 queries from the human pool
+python -m src.eval_v2 --models gemini-3-flash --conditions sighted     --eval-set 100 --m-repeats 1
+
+# Q2 sighted, gemini-3-flash, 10 queries
+python -m src.q2_eval --models gemini-3-flash     --conditions A_frame_plus_cubemap --max 10
 ```
+
+## Environment variables
+
+The defaults assume you've downloaded the HF datasets into `./data/q1`
+and `./data/q2` (i.e. you ran the quick-start above). Override via env
+vars only when your layout differs:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `Q1_DATASET_ROOT` | `./data/q1` | HF Q1 dataset root (`queries.parquet`, `frames/`, `human_labels/`) |
+| `Q2_DATASET_ROOT` | `./data/q2` | HF Q2 dataset root (one subdir per strategy) |
+| `TESTSET_ROOT` | parent of `src/` | Where logs and runs are written |
+| `RUNS_DIR` | `<TESTSET_ROOT>/runs` | Q1 eval JSONL output |
+| `Q2_RUNS_DIR` | `<TESTSET_ROOT>/runs/q2` | Q2 eval JSONL output |
+| `EK_FRAMES_ROOT` | upstream EK layout | Only used if `bundled_frame_path` is missing |
+| `HD_EPIC_FRAMES_ROOT` | upstream HD layout | Only used if `bundled_frame_path` is missing |
+| `GEMINI_API_KEY`, `OPENAI_API_KEY` | unset | Required for the respective API models |
 
 ## Documentation
 

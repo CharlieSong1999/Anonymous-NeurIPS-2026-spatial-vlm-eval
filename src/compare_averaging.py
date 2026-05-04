@@ -150,7 +150,7 @@ def collect_rows(task: str, averaging: str, set_df: pd.DataFrame,
     for aname, apath in API_MODELS.items():
         if not apath.exists():
             continue
-        for M_target in (20, 6):
+        for M_target in (20, 10, 6):
             counts, M_per = load_api_counts_at_M(
                 apath, M_target, sids_filter=pool_sids)
             if not counts:
